@@ -1,0 +1,11 @@
+# Large data files
+small_gpt_web/attentions/*.npy
+small_gpt_web/features/*.npy
+*.npy
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+/small_gpt_web/train_40k.csv
