@@ -9,3 +9,5 @@ __pycache__/
 .ipynb_checkpoints/
 
 /small_gpt_web/train_40k.csv
+
+fine_tuned_bert/

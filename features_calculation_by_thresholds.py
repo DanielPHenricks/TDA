@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Compute and plot H_0 (Betti-0) features from pre-computed attention matrices.
-
-H_0 = number of connected components of the undirected thresholded attention graph.
+Fine-tune BERT for binary classification (generated vs natural text),
+then run persistent homology analysis on the fine-tuned model's attention.
 """
 
 import os
@@ -10,55 +9,111 @@ import re
 import warnings
 
 import matplotlib.pyplot as plt
-import networkx as nx
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Dataset
+from ripser import ripser
 from tqdm import tqdm
+from transformers import BertTokenizer, BertForSequenceClassification
+from torch.optim import AdamW
 
 warnings.filterwarnings('ignore')
-
 
 # =============================================================================
 # Parameters
 # =============================================================================
 
-max_tokens_amount = 128
-MAX_SAMPLES = 100  # Only process this many samples
-layers_of_interest = list(range(12))
-thresholds_array = [0.025, 0.05, 0.1, 0.25, 0.5, 0.75]
-model_name = "bert-base-uncased"
+TRAIN_SAMPLES = 4000
+TEST_SAMPLES = 500
+MAX_LEN = 128
+BATCH_SIZE = 16
+EPOCHS = 3
+LR = 2e-5
+MODEL_NAME = "bert-base-uncased"
+SAVE_DIR = "fine_tuned_bert"
 
 subset = "test_5k"
 input_dir = "small_gpt_web/"
 output_dir = "small_gpt_web/"
-batch_size = 10
-DUMP_SIZE = 100
-
-r_file = (output_dir + 'attentions/' + subset + "_all_heads_" +
-          str(len(layers_of_interest)) + "_layers_MAX_LEN_" +
-          str(max_tokens_amount) + "_" + model_name)
 
 
 # =============================================================================
-# Helper functions
+# Dataset
 # =============================================================================
 
-def cutoff_matrix(matrix, ntokens):
-    """Return normalized submatrix of first ntokens."""
-    matrix = matrix[:ntokens, :ntokens]
-    matrix /= matrix.sum(axis=1, keepdims=True)
-    return matrix
+def text_preprocessing(text):
+    text = re.sub(r'(@.*?)[\s]', ' ', text)
+    text = re.sub(r'&amp;', '&', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def compute_h0_single(adj_matrix, thresholds, ntokens):
-    """Compute H_0 (number of connected components) at each threshold for one attention head."""
-    h0_values = []
-    mat = cutoff_matrix(adj_matrix.copy(), ntokens)
-    for thr in thresholds:
-        binary = (mat >= thr).astype(np.int8)
-        g = nx.from_numpy_array(np.array(binary))
-        h0_values.append(nx.number_connected_components(g))
-    return h0_values
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = text_preprocessing(str(self.texts[idx]))
+        encoding = self.tokenizer(
+            text,
+            return_tensors='pt',
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True
+        )
+        return {
+            'input_ids': encoding['input_ids'].squeeze(),
+            'attention_mask': encoding['attention_mask'].squeeze(),
+            'token_type_ids': encoding['token_type_ids'].squeeze(),
+            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+        }
+
+
+# =============================================================================
+# Persistence helpers
+# =============================================================================
+
+def attention_to_distance(matrix, ntokens):
+    mat = matrix[:ntokens, :ntokens].copy()
+    row_sums = mat.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1
+    mat /= row_sums
+    mat = (mat > 0).astype(np.float32) * mat
+    dist = 1.0 - mat
+    np.fill_diagonal(dist, 0)
+    dist = np.minimum(dist, dist.T)
+    return dist
+
+
+def extract_barcode_features(diagrams):
+    features = {}
+    for dim in range(min(2, len(diagrams))):
+        dgm = diagrams[dim]
+        finite_mask = np.isfinite(dgm[:, 1])
+        dgm_finite = dgm[finite_mask]
+        lengths = dgm_finite[:, 1] - dgm_finite[:, 0] if len(dgm_finite) > 0 else np.array([0.0])
+
+        prefix = f"h{dim}"
+        features[f"{prefix}_count"] = len(dgm_finite)
+        features[f"{prefix}_sum"] = float(np.sum(lengths))
+        features[f"{prefix}_mean"] = float(np.mean(lengths)) if len(lengths) > 0 else 0.0
+        features[f"{prefix}_std"] = float(np.std(lengths)) if len(lengths) > 0 else 0.0
+        features[f"{prefix}_max"] = float(np.max(lengths)) if len(lengths) > 0 else 0.0
+
+        if len(lengths) > 0 and np.sum(lengths) > 0:
+            probs = lengths / np.sum(lengths)
+            probs = probs[probs > 0]
+            features[f"{prefix}_entropy"] = float(-np.sum(probs * np.log(probs)))
+        else:
+            features[f"{prefix}_entropy"] = 0.0
+    return features
 
 
 # =============================================================================
@@ -66,141 +121,212 @@ def compute_h0_single(adj_matrix, thresholds, ntokens):
 # =============================================================================
 
 def main():
-    # Load data for token lengths
+    # --- Load data ---
     try:
         data = pd.read_csv(input_dir + subset + ".csv").reset_index(drop=True)
     except Exception:
         data = pd.read_csv(input_dir + subset + ".tsv", delimiter="\t", header=None)
         data.columns = ["0", "labels", "2", "sentence"]
 
-    print(f"Loaded {len(data)} samples")
-
-    # Estimate token lengths (capped at max_tokens_amount)
-    ntokens_array = data['sentence'].apply(
-        lambda x: min(len(x.split()), max_tokens_amount)
-    ).values
-
-    # Find attention files
-    adj_filenames = sorted([
-        output_dir + 'attentions/' + f
-        for f in os.listdir(output_dir + 'attentions/')
-        if r_file in (output_dir + 'attentions/' + f)
-    ], key=lambda x: int(x.split('_')[-1].split('of')[0][4:].strip()))
-
-    print(f"Found {len(adj_filenames)} attention files")
-    assert len(adj_filenames) > 0, f"No attention files found matching: {r_file}"
-
-    # Compute H_0 for all samples
-    # Shape: [num_samples, num_layers, num_heads, num_thresholds]
-    all_h0 = []
-    sample_idx = 0
-
-    for file_i, filename in enumerate(adj_filenames):
-        print(f"\nProcessing {filename}...")
-        attention_data = np.load(filename, allow_pickle=True)
-        # Shape: (num_samples_in_file, num_layers, num_heads, max_tokens, max_tokens)
-        n_samples = attention_data.shape[0]
-        n_layers = attention_data.shape[1]
-        n_heads = attention_data.shape[2]
-
-        for s in tqdm(range(n_samples), desc=f"File {file_i+1}/{len(adj_filenames)}"):
-            if sample_idx >= MAX_SAMPLES:
-                break
-            ntok = ntokens_array[sample_idx] if sample_idx < len(ntokens_array) else max_tokens_amount
-            sample_h0 = []
-            for layer in range(n_layers):
-                layer_h0 = []
-                for head in range(n_heads):
-                    h0_vals = compute_h0_single(
-                        attention_data[s, layer, head],
-                        thresholds_array,
-                        ntok
-                    )
-                    layer_h0.append(h0_vals)
-                sample_h0.append(layer_h0)
-            all_h0.append(sample_h0)
-            sample_idx += 1
-
-        if sample_idx >= MAX_SAMPLES:
-            break
-
-    all_h0 = np.array(all_h0)  # (samples, layers, heads, thresholds)
-    print(f"\nH_0 array shape: {all_h0.shape}")
-
-    # Save H_0 features
-    h0_file = output_dir + 'features/h0_features.npy'
-    os.makedirs(os.path.dirname(h0_file), exist_ok=True)
-    np.save(h0_file, all_h0)
-    print(f"Saved H_0 features to {h0_file}")
-
-    # ==========================================================================
-    # Plot H_0 features
-    # ==========================================================================
-
-    # If data has labels, split by label for comparison
-    has_labels = 'label' in data.columns or 'labels' in data.columns
     label_col = 'label' if 'label' in data.columns else 'labels'
+    label_map = {lbl: i for i, lbl in enumerate(sorted(data[label_col].unique()))}
+    label_names = {v: k for k, v in label_map.items()}
+    data['label_id'] = data[label_col].map(label_map)
+    print(f"Labels: {label_map}")
 
-    # Plot 1: Mean H_0 across all samples, averaged over heads, for each layer
-    fig, axes = plt.subplots(3, 4, figsize=(16, 10), sharex=True, sharey=True)
-    axes = axes.flatten()
+    # Split: first TRAIN_SAMPLES for training, next TEST_SAMPLES for analysis
+    train_data = data.head(TRAIN_SAMPLES)
+    test_data = data.iloc[TRAIN_SAMPLES:TRAIN_SAMPLES + TEST_SAMPLES].reset_index(drop=True)
+    print(f"Train: {len(train_data)}, Test: {len(test_data)}")
+    print(f"Train label dist:\n{train_data[label_col].value_counts()}")
+    print(f"Test label dist:\n{test_data[label_col].value_counts()}")
 
-    for layer in range(min(12, all_h0.shape[1])):
-        ax = axes[layer]
-        # Average over all heads: (samples, thresholds)
-        h0_layer = all_h0[:, layer, :, :].mean(axis=1)
+    # --- Device ---
+    if torch.cuda.is_available():
+        device = torch.device('cuda:0')
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    else:
+        device = torch.device('cpu')
+    print(f"Device: {device}")
 
-        if has_labels:
-            labels = data[label_col].values[:len(all_h0)]
-            unique_labels = sorted(set(labels))
-            for lbl in unique_labels:
-                mask = labels == lbl
-                mean_h0 = h0_layer[mask].mean(axis=0)
-                ax.plot(thresholds_array, mean_h0, marker='o', label=str(lbl), markersize=4)
-            ax.legend(fontsize=7)
-        else:
-            mean_h0 = h0_layer.mean(axis=0)
-            ax.plot(thresholds_array, mean_h0, marker='o', markersize=4)
+    # --- Tokenizer & Model ---
+    tokenizer = BertTokenizer.from_pretrained(MODEL_NAME, do_lower_case=True)
+    model = BertForSequenceClassification.from_pretrained(
+        MODEL_NAME, num_labels=len(label_map), output_attentions=True
+    )
+    model = model.to(device)
 
-        ax.set_title(f'Layer {layer}', fontsize=10)
+    # =========================================================================
+    # PHASE 1: Fine-tune
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("PHASE 1: Fine-tuning BERT")
+    print("=" * 60)
+
+    train_dataset = TextDataset(
+        train_data['sentence'].values,
+        train_data['label_id'].values,
+        tokenizer, MAX_LEN
+    )
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    optimizer = AdamW(model.parameters(), lr=LR)
+
+    model.train()
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}"):
+            optimizer.zero_grad()
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            token_type_ids = batch['token_type_ids'].to(device)
+            labels = batch['label'].to(device)
+
+            outputs = model(input_ids, attention_mask=attention_mask,
+                          token_type_ids=token_type_ids, labels=labels)
+
+            loss = outputs.loss
+            logits = outputs.logits
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == labels).sum().item()
+            total += len(labels)
+
+        acc = correct / total
+        avg_loss = total_loss / len(train_loader)
+        print(f"  Epoch {epoch+1}: loss={avg_loss:.4f}, accuracy={acc:.4f}")
+
+    # Save fine-tuned model
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    model.save_pretrained(SAVE_DIR)
+    tokenizer.save_pretrained(SAVE_DIR)
+    print(f"Model saved to {SAVE_DIR}/")
+
+    # =========================================================================
+    # PHASE 2: Persistence analysis on test set using fine-tuned model
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("PHASE 2: Persistent homology on fine-tuned attention")
+    print("=" * 60)
+
+    model.eval()
+    all_features = []
+
+    for idx in tqdm(range(len(test_data)), desc="Computing persistence"):
+        text = text_preprocessing(str(test_data['sentence'].iloc[idx]))
+
+        inputs = tokenizer(
+            [text], return_tensors='pt',
+            max_length=MAX_LEN, padding='max_length', truncation=True
+        )
+        ntokens = (inputs['input_ids'][0] != tokenizer.pad_token_id).sum().item()
+        ntokens = max(ntokens, 2)
+
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
+        token_type_ids = inputs['token_type_ids'].to(device)
+
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_mask,
+                          token_type_ids=token_type_ids)
+
+        attentions = [layer_att[0].cpu().numpy() for layer_att in outputs.attentions]
+
+        sample_features = []
+        for layer_att in attentions:
+            layer_features = []
+            for head_idx in range(layer_att.shape[0]):
+                dist_mat = attention_to_distance(layer_att[head_idx], ntokens)
+                result = ripser(dist_mat, maxdim=1, distance_matrix=True)
+                feats = extract_barcode_features(result['dgms'])
+                layer_features.append(feats)
+            sample_features.append(layer_features)
+        all_features.append(sample_features)
+
+    # --- Organize ---
+    labels = test_data[label_col].values
+    n_layers = len(all_features[0])
+    n_heads = len(all_features[0][0])
+    feature_names = list(all_features[0][0][0].keys())
+
+    feature_arrays = {}
+    for fname in feature_names:
+        arr = np.zeros((len(all_features), n_layers, n_heads))
+        for s in range(len(all_features)):
+            for l in range(n_layers):
+                for h in range(n_heads):
+                    arr[s, l, h] = all_features[s][l][h][fname]
+        feature_arrays[fname] = arr
+
+    os.makedirs(output_dir + 'features', exist_ok=True)
+    np.save(output_dir + 'features/persistence_finetuned.npy', feature_arrays)
+
+    # =========================================================================
+    # PLOTS
+    # =========================================================================
+    unique_labels = sorted(set(labels))
+    colors = {'natural': '#2196F3', 'generated': '#FF5722'}
+
+    # Plot 1: Boxplots
+    key_features = ['h0_count', 'h0_sum', 'h0_entropy', 'h1_count', 'h1_sum', 'h1_entropy']
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    for i, fname in enumerate(key_features):
+        ax = axes[i // 3][i % 3]
+        arr = feature_arrays[fname]
+        bp = ax.boxplot(
+            [arr[labels == lbl].mean(axis=(1, 2)) for lbl in unique_labels],
+            labels=unique_labels, patch_artist=True
+        )
+        for patch, lbl in zip(bp['boxes'], unique_labels):
+            patch.set_facecolor(colors.get(lbl, '#999'))
+            patch.set_alpha(0.6)
+        ax.set_title(fname, fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle('Mean H₀ (Connected Components) by Threshold per Layer', fontsize=14)
-    fig.supxlabel('Threshold')
-    fig.supylabel('H₀ (# Connected Components)')
+    fig.suptitle(f'Fine-tuned BERT: Persistence Features (n={TEST_SAMPLES})', fontsize=14)
     plt.tight_layout()
-    plt.savefig(output_dir + 'h0_by_layer.png', dpi=150, bbox_inches='tight')
-    print(f"Saved plot: {output_dir}h0_by_layer.png")
-    plt.show()
+    plt.savefig(output_dir + 'persistence_finetuned_boxplots.png', dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_dir}persistence_finetuned_boxplots.png")
 
-    # Plot 2: Mean H_0 averaged over all layers and heads
-    fig2, ax2 = plt.subplots(figsize=(8, 5))
-    h0_global = all_h0.mean(axis=(1, 2))  # (samples, thresholds)
-
-    if has_labels:
-        labels = data[label_col].values[:len(all_h0)]
-        unique_labels = sorted(set(labels))
+    # Plot 2: Distributions
+    fig2, axes2 = plt.subplots(2, 2, figsize=(12, 8))
+    for i, fname in enumerate(['h0_sum', 'h1_sum', 'h0_entropy', 'h1_entropy']):
+        ax = axes2[i // 2][i % 2]
+        arr = feature_arrays[fname].mean(axis=(1, 2))
         for lbl in unique_labels:
-            mask = labels == lbl
-            mean_h0 = h0_global[mask].mean(axis=0)
-            std_h0 = h0_global[mask].std(axis=0)
-            ax2.plot(thresholds_array, mean_h0, marker='o', label=str(lbl), linewidth=2)
-            ax2.fill_between(thresholds_array, mean_h0 - std_h0, mean_h0 + std_h0, alpha=0.2)
-        ax2.legend()
-    else:
-        mean_h0 = h0_global.mean(axis=0)
-        std_h0 = h0_global.std(axis=0)
-        ax2.plot(thresholds_array, mean_h0, marker='o', linewidth=2)
-        ax2.fill_between(thresholds_array, mean_h0 - std_h0, mean_h0 + std_h0, alpha=0.2)
+            ax.hist(arr[labels == lbl], bins=20, alpha=0.5, label=lbl,
+                    color=colors.get(lbl, '#999'), density=True)
+        ax.set_title(fname, fontsize=12, fontweight='bold')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
 
-    ax2.set_xlabel('Threshold')
-    ax2.set_ylabel('H₀ (# Connected Components)')
-    ax2.set_title('Mean H₀ Across All Layers and Heads')
-    ax2.grid(True, alpha=0.3)
+    fig2.suptitle(f'Fine-tuned BERT: Feature Distributions (n={TEST_SAMPLES})', fontsize=14)
     plt.tight_layout()
-    plt.savefig(output_dir + 'h0_global.png', dpi=150, bbox_inches='tight')
-    print(f"Saved plot: {output_dir}h0_global.png")
-    plt.show()
+    plt.savefig(output_dir + 'persistence_finetuned_distributions.png', dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_dir}persistence_finetuned_distributions.png")
+
+    # --- Stats ---
+    from scipy import stats
+    print("\n" + "=" * 60)
+    print("FEATURE COMPARISON (Fine-tuned BERT)")
+    print("=" * 60)
+    for fname in feature_names:
+        arr = feature_arrays[fname].mean(axis=(1, 2))
+        for lbl in unique_labels:
+            vals = arr[labels == lbl]
+            print(f"  {fname:15s} [{lbl:10s}]: mean={vals.mean():.4f} ± {vals.std():.4f}")
+        mask_0, mask_1 = labels == unique_labels[0], labels == unique_labels[1]
+        t_stat, p_val = stats.ttest_ind(arr[mask_0], arr[mask_1])
+        sig = "***" if p_val < 0.001 else "**" if p_val < 0.01 else "*" if p_val < 0.05 else "ns"
+        print(f"  {'':15s} p={p_val:.4f} {sig}\n")
 
     print("Done!")
 
