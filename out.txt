@@ -1,0 +1,24 @@
+Running Takens...
+
+=== Takens' Embedding Analysis ===
+Running Mapper...
+
+=== Mapper Algorithm Analysis ===
+Traceback (most recent call last):
+  File "/Users/daniel/Code/tda4atd/test_advanced_vis.py", line 25, in <module>
+    mapper_analysis(labels_used, X_val_4d, cache_dir)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/daniel/Code/tda4atd/features_colab.py", line 346, in mapper_analysis
+    html = mapper.visualize(
+        graph, title="Mapper Graph — TDA Features",
+        custom_tooltips=labels_used, color_values=nat_vec,
+        color_function_name="Fraction Natural",
+    )
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/kmapper/utils.py", line 11, in wrapper
+    return f(*args, **kwargs)
+  File "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages/kmapper/kmapper.py", line 836, in visualize
+    raise Exception(
+        "Visualize requires a mapper with more than 0 nodes. \nIt is possible that the constructed mapper could have been constructed with bad parameters. This can occasionally happens when using the default clustering algorithm. Try changing `eps` or `min_samples` in the DBSCAN clustering algorithm."
+    )
+Exception: Visualize requires a mapper with more than 0 nodes. 
+It is possible that the constructed mapper could have been constructed with bad parameters. This can occasionally happens when using the default clustering algorithm. Try changing `eps` or `min_samples` in the DBSCAN clustering algorithm.

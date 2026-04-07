@@ -8,7 +8,7 @@ attention maps and trains a Logistic Regression classifier.
 
 Usage (Colab):
   1. Upload test_5k.csv and valid_5k.csv to /content/
-  2. !pip install transformers ripser scikit-learn
+  2. !pip install transformers ripser scikit-learn kmapper networkx
   3. !python features_colab.py
 """
 
@@ -247,6 +247,135 @@ def compute_all_features_for_sample(attention, ntokens, thresholds):
 
 
 # =============================================================================
+# Feature Group 4: Advanced Visualizations (Takens / Mapper)
+# =============================================================================
+
+from mpl_toolkits.mplot3d import Axes3D   # noqa: F401
+
+def takens_embedding(signal, m=3, tau=1):
+    signal = np.asarray(signal, dtype=float)
+    T = len(signal)
+    n_points = T - (m - 1) * tau
+    if n_points <= 0:
+        raise ValueError("Signal too short.")
+    embedded = np.empty((n_points, m))
+    for i in range(n_points):
+        for j in range(m):
+            embedded[i, j] = signal[i + j * tau]
+    return embedded
+
+def takens_layer_analysis(labels_used, X_features_4d, output_dir, tau=1, m=3, feature_idx=37):
+    print("\n=== Takens' Embedding Analysis ===")
+    n_layers, n_heads, n_samples, n_feat = X_features_4d.shape
+    
+    # Average across heads → (12, n_samples)
+    layer_signals = np.mean(X_features_4d[:, :, :, feature_idx], axis=1)
+    X_ts = layer_signals.T # (n_samples, 12)
+    
+    # Normalise per sample
+    mu  = X_ts.mean(axis=1, keepdims=True)
+    sig = X_ts.std(axis=1, keepdims=True) + 1e-9
+    X_ts_norm = (X_ts - mu) / sig
+    
+    nat_mask = (labels_used == 'natural')
+    gen_mask = (labels_used == 'generated')
+
+    nat_embedded, gen_embedded = [], []
+    for i in range(n_samples):
+        try:
+            emb = takens_embedding(X_ts_norm[i], m=m, tau=tau)
+            if labels_used[i] == 'natural': nat_embedded.append(emb)
+            else: gen_embedded.append(emb)
+        except ValueError:
+            pass
+
+    nat_traj = np.mean(nat_embedded, axis=0)
+    gen_traj = np.mean(gen_embedded, axis=0)
+
+    fig = plt.figure(figsize=(10, 6))
+    ax  = fig.add_subplot(111, projection='3d')
+
+    def _plot_traj(ax, traj, color, label):
+        n = traj.shape[0]
+        for k in range(n - 1):
+            alpha = 0.35 + 0.65 * k / max(n - 2, 1)
+            ax.plot(traj[k:k+2, 0], traj[k:k+2, 1], traj[k:k+2, 2], color=color, alpha=alpha, linewidth=2.5)
+        ax.scatter(*traj[0],  color=color, s=120, marker='^', zorder=5, label=f'{label} – start')
+        ax.scatter(*traj[-1], color=color, s=120, marker='s', zorder=5, label=f'{label} – end')
+
+    _plot_traj(ax, nat_traj, '#2563EB', 'Natural')
+    _plot_traj(ax, gen_traj, '#DC2626', 'Generated')
+
+    ax.set_title(f"Takens' Embedding — Average Trajectory (τ={tau}, m={m})")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, 'Takens_Embedding_3D.png'), dpi=150)
+    plt.close()
+
+def mapper_analysis(labels_used, X_features_4d, output_dir):
+    print("\n=== Mapper Algorithm Analysis ===")
+    try:
+        import kmapper as km
+        import sklearn.cluster
+        from sklearn.decomposition import PCA
+        import networkx as nx
+    except ImportError:
+        print("  Missing kmapper/networkx! Run: !pip install kmapper networkx")
+        return
+
+    n_layers, n_heads, n_samples, n_feat = X_features_4d.shape
+    X_raw = np.mean(X_features_4d, axis=(0, 1)) # (n_samples, n_feat)
+    X_raw = np.nan_to_num(X_raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw)
+
+    nat_vec = (labels_used == 'natural').astype(float)
+    
+    pca = PCA(n_components=2)
+    lens = pca.fit_transform(X)
+
+    mapper = km.KeplerMapper(verbose=0)
+    graph  = mapper.map(
+        lens, X,
+        cover=km.Cover(n_cubes=12, perc_overlap=0.5),
+        clusterer=sklearn.cluster.DBSCAN(eps=8.0, min_samples=3)
+    )
+
+    if len(graph['nodes']) == 0:
+        print("  Mapper graph produced 0 nodes (try adjusting eps/min_samples). Skipping HTML/Static output.")
+        return
+
+    html_path = os.path.join(output_dir, 'Mapper_graph.html')
+    html = mapper.visualize(
+        graph, title="Mapper Graph — TDA Features",
+        custom_tooltips=labels_used, color_values=nat_vec,
+        color_function_name="Fraction Natural",
+    )
+    with open(html_path, 'w') as fh: fh.write(html)
+    
+    G = nx.Graph()
+    for node in graph['nodes']:
+        member_ids = graph['nodes'][node]
+        G.add_node(node, nat_frac=np.mean(nat_vec[member_ids]), size=len(member_ids))
+    for src, dsts in graph['links'].items():
+        for dst in dsts: G.add_edge(src, dst)
+
+    if len(G.nodes) > 0:
+        pos = nx.spring_layout(G, seed=42, k=2.0)
+        nat_fracs  = np.array([G.nodes[n]['nat_frac'] for n in G.nodes])
+        node_sizes = np.array([G.nodes[n]['size']     for n in G.nodes]) * 40 + 80
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+        nx.draw_networkx_edges(G, pos, ax=ax, alpha=0.35, edge_color='#94a3b8')
+        sc = ax.scatter([pos[n][0] for n in G.nodes], [pos[n][1] for n in G.nodes], c=nat_fracs, cmap=plt.cm.RdYlBu, s=node_sizes, vmin=0, vmax=1)
+        fig.colorbar(sc, ax=ax, shrink=0.7).set_label('Fraction Natural text')
+        ax.axis('off')
+        fig.savefig(os.path.join(output_dir, 'Mapper_graph_static.png'), dpi=150)
+        plt.close()
+
+
+# =============================================================================
 # Main
 # =============================================================================
 
@@ -438,6 +567,30 @@ def main():
     plt.tight_layout()
     plt.savefig(os.path.join(cache_dir, 'head_accuracy_heatmap.png'), dpi=150)
     print(f"Saved heatmap.")
+
+    # =========================================================================
+    # Phase 5 & 6: Takens and Mapper Visualization
+    # =========================================================================
+    try:
+        print("\n" + "=" * 60)
+        print("PHASE 5 & 6: Advanced TDA Visualizations")
+        print("=" * 60)
+        
+        # Reshape Validation set for Advanced Visualizations
+        # X_val: (n_samples, 13968) -> (n_samples, 12, 12, 97)
+        X_val_4d_base = X_val.reshape((len(val_data), 12, 12, feats_per_head))
+        
+        # Transpose to Notebook format: (12_layers, 12_heads, n_samples, n_feats)
+        X_val_4d = np.transpose(X_val_4d_base, (1, 2, 0, 3))
+        
+        # We need the original string labels array for class matching:
+        labels_used = val_data['label'].values
+        
+        takens_layer_analysis(labels_used, X_val_4d, cache_dir, feature_idx=37) # 37 = H0 Sum
+        mapper_analysis(labels_used, X_val_4d, cache_dir)
+        print("Finished generating advanced visualizations.")
+    except Exception as e:
+        print(f"Failed to run advanced visualizations: {e}")
 
     # =========================================================================
     # Summary
